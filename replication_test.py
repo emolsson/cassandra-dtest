@@ -1,4 +1,5 @@
 from collections import defaultdict
+import os
 import re
 import time
 
@@ -254,3 +255,54 @@ class ReplicationTest(Tester):
         # Given a diverse enough keyset, each node in the second
         # datacenter should get a chance to be a forwarder:
         self.assertEqual(len(forwarders_used), 3)
+
+
+class Cassandra10238Test(Tester):
+    """
+    Test to repro CASSANDRA-10238, wherein consolidating racks without a restart could violate RF contract.
+    """
+    def test(self):
+        cluster = self.cluster
+        cluster.populate(3)
+        node1, node2, node3 = cluster.nodelist()
+
+        # start with separate racks
+        for i, node in enumerate(cluster.nodelist()):
+            with open(os.path.join(node.get_conf_dir(), 'cassandra-rackdc.properties'), 'w') as topo_file:
+                topo_file.write("dc=DC1\n")
+                topo_file.write("rack=RAC{}".format(i))
+
+        cluster.set_configuration_options(values={'endpoint_snitch': 'org.apache.cassandra.locator.GossipingPropertyFileSnitch'})
+        cluster.start()
+
+        conn = self.patient_cql_connection(node1)
+
+        # small stress write to build ks/table for us
+        node1.stress(['write', 'n=20', '-rate', 'threads=50', '-schema', 'keyspace=testing', '-pop', 'seq=1..20'])
+
+        conn.execute("""ALTER KEYSPACE testing WITH replication = {'class':'NetworkTopologyStrategy', 'DC1':3}""")
+        conn.execute("""ALTER TABLE testing.standard1 WITH compaction = {'class': 'DateTieredCompactionStrategy'}""")
+
+        node1.stress(['write', 'n=10M', '-rate', 'threads=50', '-schema', 'keyspace=testing', '-pop', 'seq=1..10M'])
+
+        for node in cluster.nodelist():
+            out, err = node.nodetool("getendpoints testing standard1 36F41194")
+            out = out.rstrip()  # remove extra \n from output
+            debug("getendpoints stdout: \n{}".format(out))
+            debug("getendpoints stderr: \n{}".format(err))
+            self.assertEqual(len(out.split('\n')), 3, "wrong number of endpoints found: {}".format(len(out.split('\n'))))
+
+        # consolidate node1/node3 racks to "RAC1"
+        for node in [node1, node3]:
+            with open(os.path.join(node.get_conf_dir(), 'cassandra-rackdc.properties'), 'w') as topo_file:
+                topo_file.write("dc=DC1\n")
+                topo_file.write("rack=RAC1")
+
+            time.sleep(30)
+
+        for node in cluster.nodelist():
+            out, err = node.nodetool("getendpoints testing standard1 36F41194")
+            out = out.rstrip()  # remove extra \n from output
+            debug("getendpoints stdout: \n{}".format(out))
+            debug("getendpoints stderr: \n{}".format(err))
+            self.assertEqual(len(out.split('\n')), 3, "wrong number of endpoints found: {}".format(len(out.split('\n'))))
